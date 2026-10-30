@@ -2,19 +2,16 @@
 """
 diskette — Memoria compartida multi-agente (MCP server, cero dependencias)
 =======================================================================
-Un solo archivo. SQLite + FTS5 como índice local; el espejo Markdown es la
-FUENTE CANÓNICA (legible por humanos).
+Un solo archivo. SQLite + FTS5 como backend; DB-only (sin espejo MD automático).
 
 Uso:
-    python3 diskette.py            # MCP stdio (sincroniza MD -> SQLite al arrancar)
-    python3 diskette.py --sync     # sincronizar MD -> SQLite y reportar
-    python3 diskette.py --export   # regenerar MD limpio desde SQLite
-    python3 diskette.py --path     # imprimir ruta de la DB
-    python3 diskette.py --optimize # optimizar índice FTS5
+    python3 diskette.py              # MCP stdio
+    python3 diskette.py --dump [p]   # volcar proyecto(s) a diskette-<proyecto>.md
+    python3 diskette.py --path       # imprimir ruta de la DB
+    python3 diskette.py --optimize   # optimizar índice FTS5
 
 Variables de entorno:
     DISKETTE_DB    Ruta de la base SQLite (default: ~/.diskette/diskette.db)
-    DISKETTE_MD    Dir. del espejo Markdown canónico (default: ~/.diskette)
 """
 
 import atexit
@@ -28,11 +25,7 @@ import time
 
 DB_PATH = os.environ.get(
     "DISKETTE_DB",
-    os.path.join(os.path.expanduser("~"), ".diskette", "memory.db"),
-)
-MD_DIR = os.environ.get(
-    "DISKETTE_MD",
-    os.path.join(os.path.expanduser("~"), ".diskette"),
+    os.path.join(os.path.expanduser("~"), ".diskette", "diskette.db"),
 )
 
 KINDS = (
@@ -81,9 +74,10 @@ END;
 CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project, created_at DESC);
 """
 
+# Regex para parsear archivos diskette-*.md (dump format) al importar
 _ENTRY_RE = re.compile(r"^## \[([a-z]+)\] (.+?)[ \t]*\r?$", re.M)
 _META_RE = re.compile(
-    r"^\*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})(?:[ ]·[ ]([^*`]+?))?(?:[ ]`([^`]*)`)?\*[ \t]*$"
+    r"^\*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})(?:[ ]·[ ]([^*`]+?))?(?:[ ]`([^`]*)`)?\\*[ \t]*$"
 )
 
 _conn = None
@@ -124,83 +118,122 @@ def entry_key(project, title, content):
     return hashlib.sha256(raw).hexdigest()[:32]
 
 
-# ------------------------------------------------------------ markdown ---
+# ---------------------------------------------------------- dump / load ---
 
-def md_mirror(row):
-    """Append-only espejo humano; al ser parseable, ES la fuente canónica."""
-    os.makedirs(MD_DIR, exist_ok=True)
-    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in row["project"])
-    path = os.path.join(MD_DIR, f"{safe}.md")
-    tags = f" `{row['tags']}`" if row["tags"] else ""
-    agent = f" · {row['agent']}" if row["agent"] else ""
-    with open(path, "a", encoding="utf-8", newline="\n") as f:
-        f.write(
-            f"\n## [{row['kind']}] {row['title']}\n"
-            f"*{time.strftime('%Y-%m-%d %H:%M', time.localtime(row['created_at']))}"
-            f"{agent}{tags}*\n\n{row['content'].strip()}\n"
+MAX_DUMP_FILE = 1 * 1024 * 1024  # 1 MB
+
+
+def _safe_filename(name):
+    """Nombre de archivo seguro cross-platform (Win/Mac/Linux)."""
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+
+
+def _render_md(project, rows):
+    """Genera el contenido Markdown para un volcado de proyecto."""
+    parts = [f"# Memoria: {project}\n"]
+    for r in rows:
+        tags = f" `{r['tags']}`" if r["tags"] else ""
+        agent = f" · {r['agent']}" if r["agent"] else ""
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["created_at"]))
+        parts.append(
+            f"\n## [{r['kind']}] {r['title']}\n"
+            f"*{ts}{agent}{tags}*\n\n{r['content'].strip()}\n"
         )
+    return "".join(parts)
 
 
-def sync_from_md():
-    """Importar entradas nuevas del espejo Markdown a SQLite (idempotente)."""
-    if not os.path.isdir(MD_DIR):
-        return 0
-    added = 0
-    MAX_FILES = 1000  # Límite para prevenir DoS
-    MAX_FILE_SIZE = 1 * 1024 * 1024  # 1MB por archivo (cross-platform safe)
-    file_count = 0
-    real_md_dir = os.path.realpath(MD_DIR)
-    for fn in sorted(os.listdir(MD_DIR)):
-        if file_count >= MAX_FILES:
-            break
-        if not fn.endswith(".md") or fn.startswith("_"):
+def dump_project(project, out_dir=None):
+    """Volcar memorias de un proyecto a diskette-<proyecto>.md.
+
+    Args:
+        project: Nombre del proyecto.
+        out_dir: Directorio destino (default: directorio actual).
+
+    Returns:
+        Tupla (ruta_archivo, num_memorias) o (None, 0) si no hay datos.
+    """
+    rows = db().execute(
+        "SELECT * FROM memories WHERE project=? ORDER BY created_at", (project,)
+    ).fetchall()
+    if not rows:
+        return None, 0
+    out_dir = out_dir or os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
+    filename = f"diskette-{_safe_filename(project)}.md"
+    path = os.path.join(out_dir, filename)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(_render_md(project, rows))
+    return path, len(rows)
+
+
+def load_from_md(filepath, project=None):
+    """Importar entradas desde un archivo Markdown a la DB (idempotente).
+
+    El archivo debe seguir el formato diskette (## [kind] Title / *meta* / content).
+    Si no se indica proyecto, se infiere del nombre del archivo.
+
+    Args:
+        filepath: Ruta absoluta o relativa al archivo .md.
+        project: Nombre del proyecto (default: nombre del archivo sin extensión
+                 y sin prefijo 'diskette-').
+
+    Returns:
+        Tupla (added, skipped) con contadores.
+    """
+    filepath = os.path.abspath(filepath)
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(f"No existe: {filepath}")
+    file_size = os.path.getsize(filepath)
+    if file_size > MAX_DUMP_FILE:
+        raise ValueError(f"Archivo demasiado grande ({file_size} bytes, máx {MAX_DUMP_FILE})")
+
+    if project is None:
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        # Quitar prefijo 'diskette-' si existe
+        if base.startswith("diskette-"):
+            base = base[len("diskette-"):]
+        project = base
+
+    with open(filepath, encoding="utf-8") as f:
+        text = f.read().replace("\r\n", "\n")
+
+    matches = list(_ENTRY_RE.finditer(text))
+    added, skipped = 0, 0
+    for i, m in enumerate(matches):
+        kind, title = m.group(1), m.group(2).strip()
+        if kind not in KINDS:
+            kind = "fact"
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        block = text[m.end():end]
+        lines = block.lstrip("\n").split("\n")
+        agent, tags = "", ""
+        created = now()
+        if lines:
+            mm = _META_RE.match(lines[0].strip())
+            if mm:
+                try:
+                    created = time.mktime(time.strptime(mm.group(1), "%Y-%m-%d %H:%M"))
+                except (ValueError, OverflowError):
+                    pass
+                agent = (mm.group(2) or "").strip()
+                tags = (mm.group(3) or "").strip()
+                lines = lines[1:]
+        content = "\n".join(lines).strip("\n ")
+        if not title or not content:
+            skipped += 1
             continue
-        project = fn[:-3]
-        try:
-            file_path = os.path.join(MD_DIR, fn)
-            # Protección contra symlinks que apunten fuera del directorio
-            real_path = os.path.realpath(file_path)
-            if not real_path.startswith(real_md_dir + os.sep) and real_path != real_md_dir:
-                continue
-            file_size = os.path.getsize(file_path)
-            if file_size > MAX_FILE_SIZE:
-                continue
-            with open(file_path, encoding="utf-8") as f:
-                text = f.read().replace("\r\n", "\n")
-        except OSError:
-            continue
-        file_count += 1
-        matches = list(_ENTRY_RE.finditer(text))
-        for i, m in enumerate(matches):
-            kind, title = m.group(1), m.group(2).strip()
-            if kind not in KINDS:
-                kind = "fact"
-            block = text[m.end():matches[i + 1].start() if i + 1 < len(matches) else len(text)]
-            lines = block.lstrip("\n").split("\n")
-            agent, tags = "", ""
-            created = now()
-            if lines:
-                mm = _META_RE.match(lines[0].strip())
-                if mm:
-                    try:
-                        created = time.mktime(time.strptime(mm.group(1), "%Y-%m-%d %H:%M"))
-                    except (ValueError, OverflowError):
-                        pass
-                    agent = (mm.group(2) or "").strip()
-                    tags = (mm.group(3) or "").strip()
-                    lines = lines[1:]
-            content = "\n".join(lines).strip("\n ")
-            if not title or not content:
-                continue
-            key = entry_key(project, title, content)
-            cur = db().execute(
-                "INSERT OR IGNORE INTO memories (key, project, kind, title, content,"
-                " tags, agent, session, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (key, project, kind, title, content, tags, agent, "", created),
-            )
-            added += cur.rowcount
+        key = entry_key(project, title, content)
+        cur = db().execute(
+            "INSERT OR IGNORE INTO memories (key, project, kind, title, content,"
+            " tags, agent, session, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (key, project, kind, title, content, tags, agent, "", created),
+        )
+        if cur.rowcount:
+            added += 1
+        else:
+            skipped += 1
     db().commit()
-    return added
+    return added, skipped
 
 
 # ---------------------------------------------------------------- tools ---
@@ -238,8 +271,7 @@ def t_save(args):
     row = db().execute("SELECT * FROM memories WHERE id=?", (cur.lastrowid,)).fetchone()
     if row is None:
         return "Error: no se pudo recuperar la memoria guardada"
-    md_mirror(row)
-    return f"OK guardado #{row['id']} [{kind}] en '{project}' (proyecta a MD)"
+    return f"OK guardado #{row['id']} [{kind}] en '{project}'"
 
 
 def t_search(args):
@@ -251,7 +283,7 @@ def t_search(args):
         limit = 8
     if not q:
         return "(query vacío)"
-    # Validación más robusta: solo permitir caracteres alfanuméricos y espacios
+    # Validación: solo permitir caracteres alfanuméricos y espacios
     safe_terms = [t for t in q.split() if t.isalnum()]
     if not safe_terms:
         return "(query inválido: caracteres no permitidos)"
@@ -326,8 +358,8 @@ def t_session_start(args):
         parts.append("### Últimos estados de progreso")
         parts.extend(f"- {r['title']}: {r['content'][:300]}" for r in prog)
     parts.append(
-        "\n> Protocolo: guarda con mem_save al completar trabajo significativo; "
-        "busca con mem_search antes de decidir; deja un 'progress' al terminar."
+        "\n> Protocolo: guarda con diskette_save al completar trabajo significativo; "
+        "busca con diskette_search antes de decidir; deja un 'progress' al terminar."
     )
     return "\n".join(parts)
 
@@ -341,13 +373,42 @@ def t_forget(args):
         return "(id requerido)"
     db().execute("DELETE FROM memories WHERE id=?", (mid,))
     db().commit()
-    return (f"OK eliminado #{mid}. Nota: el espejo MD es append-only; "
-            "regenera con --export y (si usas git) commitea para propagar el borrado.")
+    return f"OK eliminado #{mid}"
+
+
+def t_dump(args):
+    """Volcar memorias de un proyecto a diskette-<proyecto>.md en el dir actual."""
+    project = args.get("project") or os.path.basename(os.getcwd())
+    out_dir = args.get("out_dir") or os.getcwd()
+    path, count = dump_project(project, out_dir)
+    if not path:
+        return f"(sin memorias para proyecto '{project}')"
+    return f"OK volcado {count} memoria(s) de '{project}' → {path}"
+
+
+def t_load(args):
+    """Importar memorias desde un archivo Markdown al proyecto en la DB."""
+    filepath = args.get("filepath", "").strip()
+    if not filepath:
+        return "(filepath requerido)"
+    project = args.get("project")  # None => inferir del nombre del archivo
+    try:
+        added, skipped = load_from_md(filepath, project)
+    except FileNotFoundError as e:
+        return f"(error: {e})"
+    except ValueError as e:
+        return f"(error: {e})"
+    parts = [f"OK importadas {added} memoria(s)"]
+    if skipped:
+        parts.append(f"({skipped} omitidas: duplicadas o vacías)")
+    if project:
+        parts.append(f"en proyecto '{project}'")
+    return " ".join(parts)
 
 
 TOOLS = [
     {
-        "name": "mem_save",
+        "name": "diskette_save",
         "description": (
             "Guardar una memoria persistente en la base local (la leen TODOS "
             "los agentes de esta máquina). Usar después de decisiones, bugfixes, "
@@ -362,13 +423,13 @@ TOOLS = [
                 "kind": {"type": "string", "enum": list(KINDS), "default": "fact"},
                 "project": {"type": "string", "description": "Default: carpeta actual"},
                 "tags": {"type": "string", "description": "Comma-separated para descubribilidad"},
-                "agent": {"type": "string", "description": "Quien escribe (opencode, claude-code, cursor, etc.)"},
+                "agent": {"type": "string", "description": "Quien escribe (opencode, claude-code, cursor, antigravity, etc.)"},
             },
             "required": ["title", "content"],
         },
     },
     {
-        "name": "mem_search",
+        "name": "diskette_search",
         "description": (
             "Buscar en la memoria local (FTS5, ranking BM25). Llamar ANTES de "
             "tomar decisiones que puedan haberse resuelto antes. Si no hay "
@@ -385,7 +446,7 @@ TOOLS = [
         },
     },
     {
-        "name": "mem_session_start",
+        "name": "diskette_session_start",
         "description": (
             "LLAMAR SIEMPRE al iniciar sesión: resume actividad reciente del proyecto, "
             "estado de progreso y reglas. Recupera contexto tras compaction."
@@ -396,7 +457,7 @@ TOOLS = [
         },
     },
     {
-        "name": "mem_recent",
+        "name": "diskette_recent",
         "description": "Listar memorias más recientes (cronológico).",
         "inputSchema": {
             "type": "object",
@@ -407,22 +468,56 @@ TOOLS = [
         },
     },
     {
-        "name": "mem_forget",
-        "description": "Eliminar una memoria por id (regenera MD con --export si quieres limpiar el espejo).",
+        "name": "diskette_forget",
+        "description": "Eliminar una memoria por id.",
         "inputSchema": {
             "type": "object",
             "properties": {"id": {"type": "integer"}},
             "required": ["id"],
         },
     },
+    {
+        "name": "diskette_dump",
+        "description": (
+            "Volcar memorias de un proyecto a un archivo diskette-<proyecto>.md. "
+            "Útil para compartir, hacer backup, o commitear a git."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Proyecto a volcar (default: carpeta actual)"},
+                "out_dir": {"type": "string", "description": "Directorio destino (default: directorio actual)"},
+            },
+        },
+    },
+    {
+        "name": "diskette_load",
+        "description": (
+            "Importar memorias desde un archivo Markdown (formato diskette) a la DB. "
+            "El usuario indica la ruta del archivo. Idempotente: no duplica entradas."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filepath": {"type": "string", "description": "Ruta al archivo .md a importar"},
+                "project": {
+                    "type": "string",
+                    "description": "Proyecto destino (default: se infiere del nombre del archivo sin prefijo diskette-)",
+                },
+            },
+            "required": ["filepath"],
+        },
+    },
 ]
 
 DISPATCH = {
-    "mem_save": t_save,
-    "mem_search": t_search,
-    "mem_recent": t_recent,
-    "mem_session_start": t_session_start,
-    "mem_forget": t_forget,
+    "diskette_save": t_save,
+    "diskette_search": t_search,
+    "diskette_recent": t_recent,
+    "diskette_session_start": t_session_start,
+    "diskette_forget": t_forget,
+    "diskette_dump": t_dump,
+    "diskette_load": t_load,
 }
 
 # ------------------------------------------------------------- MCP stdio ---
@@ -440,12 +535,8 @@ def fail(msg_id, code, message):
 
 
 def run_stdio():
-    added = sync_from_md()
-    if added:
-        sys.stderr.write(f"[diskette] {added} entrada(s) importada(s) de {MD_DIR}\n")
-    else:
-        sys.stderr.write(f"[diskette] listo (MD: {MD_DIR})\n")
     db()
+    sys.stderr.write(f"[diskette] listo (DB: {DB_PATH})\n")
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -459,7 +550,7 @@ def run_stdio():
             respond(msg_id, {
                 "protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "diskette", "version": "0.31.0"},
+                "serverInfo": {"name": "diskette", "version": "0.4.0"},
             })
         elif method == "ping":
             respond(msg_id, {})
@@ -480,34 +571,58 @@ def run_stdio():
         # notifications/* : ignorar
 
 
-def run_export():
+# ------------------------------------------------------------------ CLI ---
+
+def run_dump_cli(argv):
+    """CLI: --dump [proyecto...] — volcar a diskette-<proyecto>.md."""
     db()
-    os.makedirs(MD_DIR, exist_ok=True)
-    projects = [r[0] for r in db().execute("SELECT DISTINCT project FROM memories ORDER BY project")]
+    # Recolectar proyectos a volcar
+    projects = []
+    idx = argv.index("--dump") + 1
+    while idx < len(argv) and not argv[idx].startswith("--"):
+        projects.append(argv[idx])
+        idx += 1
+    if not projects:
+        # Todos los proyectos
+        projects = [r[0] for r in db().execute(
+            "SELECT DISTINCT project FROM memories ORDER BY project"
+        )]
+    if not projects:
+        print("(sin memorias en la DB)")
+        return
     for p in projects:
-        rows = db().execute(
-            "SELECT * FROM memories WHERE project=? ORDER BY created_at", (p,)
-        ).fetchall()
-        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in p)
-        with open(os.path.join(MD_DIR, f"{safe}.md"), "w", encoding="utf-8", newline="\n") as f:
-            f.write(f"# Memoria: {p}\n")
-            for r in rows:
-                tags = f" `{r['tags']}`" if r['tags'] else ""
-                agent = f" · {r['agent']}" if r['agent'] else ""
-                f.write(
-                    f"\n## [{r['kind']}] {r['title']}\n"
-                    f"*{time.strftime('%Y-%m-%d %H:%M', time.localtime(r['created_at']))}"
-                    f"{agent}{tags}*\n\n{r['content'].strip()}\n"
-                )
-    print(f"exportado {len(projects)} proyecto(s) a {MD_DIR}")
+        path, count = dump_project(p)
+        if path:
+            print(f"  {count} memoria(s) → {path}")
+        else:
+            print(f"  '{p}': sin memorias")
+
+
+def run_load_cli(argv):
+    """CLI: --load <archivo.md> [--project nombre]"""
+    idx = argv.index("--load") + 1
+    if idx >= len(argv) or argv[idx].startswith("--"):
+        print("Uso: diskette.py --load <archivo.md> [--project nombre]")
+        sys.exit(1)
+    filepath = argv[idx]
+    project = None
+    if "--project" in argv:
+        pi = argv.index("--project") + 1
+        if pi < len(argv):
+            project = argv[pi]
+    try:
+        added, skipped = load_from_md(filepath, project)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    print(f"{added} entrada(s) importada(s), {skipped} omitida(s)")
 
 
 if __name__ == "__main__":
-    if "--export" in sys.argv:
-        run_export()
-    elif "--sync" in sys.argv:
-        n = sync_from_md()
-        print(f"{n} entrada(s) nueva(s) importadas a {DB_PATH}")
+    if "--dump" in sys.argv:
+        run_dump_cli(sys.argv)
+    elif "--load" in sys.argv:
+        run_load_cli(sys.argv)
     elif "--path" in sys.argv:
         print(DB_PATH)
     elif "--optimize" in sys.argv:
